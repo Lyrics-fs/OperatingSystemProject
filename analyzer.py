@@ -40,6 +40,13 @@ class DiskAnalyzer:
 
                             # 维护 Top-N 大文件
                             self._update_top_files(entry.path, size)
+
+                            dir_stat['children'].append({
+                                'path': entry.path,
+                                'name': entry.name,
+                                'size': size,
+                                'children': None  # 用 None 区分文件
+                            })
                         except (PermissionError, OSError):
                             pass
 
