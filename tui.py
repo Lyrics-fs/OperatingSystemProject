@@ -23,6 +23,8 @@ class TerminalUI:
 
     def _main_loop(self, stdscr):
         curses.curs_set(0)  # 隐藏光标
+        curses.start_color()
+        curses.use_default_colors()
         curses.init_pair(1, curses.COLOR_CYAN, curses.COLOR_BLACK)  # 目录颜色
         curses.init_pair(2, curses.COLOR_GREEN, curses.COLOR_BLACK)  # 大小颜色
         curses.init_pair(3, curses.COLOR_BLACK, curses.COLOR_WHITE)  # 选中行颜色
