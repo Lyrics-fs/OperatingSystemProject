@@ -3,7 +3,7 @@ import sys
 import os
 from analyzer import DiskAnalyzer
 from tui import TerminalUI
-from reporter import HTMLReporter
+from reporter import EnhancedHTMLReporter
 
 
 def main():
@@ -11,6 +11,7 @@ def main():
     parser.add_argument("path", nargs="?", default=".", help="要扫描的目录路径 (默认: 当前目录)")
     parser.add_argument("--report", action="store_true", help="生成 HTML 报告而不启动 UI")
     parser.add_argument("--depth", type=int, default=2, help="目录扫描深度 (默认: 2)")
+    parser.add_argument("--enhanced", action="store_true", help="生成增强版 HTML 报告")
 
     args = parser.parse_args()
 
@@ -24,13 +25,13 @@ def main():
     # 1. 执行分析
     analyzer = DiskAnalyzer(target_path, max_depth=args.depth)
     tree_data = analyzer.scan()
-    summary_data = analyzer.get_summary()
-
+    
     # 2. 根据模式输出
-    if args.report:
+    if args.report or args.enhanced:
         # 生成 HTML 报告
-        reporter = HTMLReporter(tree_data, summary_data)
-        reporter.generate("disk_report.html")
+        summary_data = analyzer.get_enhanced_summary(tree_data['size'])
+        reporter = EnhancedHTMLReporter(summary_data)
+        reporter.generate("enhanced_disk_report.html")
     else:
         # 启动 TUI 界面
         try:
@@ -42,3 +43,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
