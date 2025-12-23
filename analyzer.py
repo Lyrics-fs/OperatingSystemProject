@@ -8,76 +8,171 @@ class DiskAnalyzer:
     def __init__(self, root_path, max_depth=2):
         self.root_path = os.path.abspath(root_path)
         self.max_depth = max_depth
-        self.file_types = collections.defaultdict(int) 
-        self.top_files = []  # 存储 (size, path)
-        self.top_n_limit = 20
-        self.flat_dirs = []  # 扁平目录统计
-        self.duplicate_files = collections.defaultdict(list)  # 重复文件 (hash: [files])
-        self.cleanable_files = []  # 可清理文件
-        self.history_data = []  # 历史数据（模拟）
-        self.disk_usage = self._get_disk_usage()  # 磁盘使用率
 
-    def scan(self):
-        """执行扫描并返回目录树结构"""
-        dir_tree = self._scan_recursive(self.root_path, 0)
+        self.file_types = collections.defaultdict(int)
+        self.top_files = []  # (size, path)
+        self.top_n_limit = 20
+
+        self.flat_dirs = []
+        self.duplicate_files = collections.defaultdict(list)
+        self.cleanable_files = []
+        self.history_data = []
+        self.disk_usage = self._get_disk_usage()
+
+        # 扫描过程统计（用于命令行实时展示）
+        self.scanned_files_count = 0
+        self.scanned_bytes = 0
+        self.current_path = ""
+        self.scan_started_at = None
+
+    def scan(self, on_progress=None, stop_event=None):
+        self.scanned_files_count = 0
+        self.scanned_bytes = 0
+        self.current_path = self.root_path
+        self.scan_started_at = datetime.datetime.now()
+
+        # 每次扫描前清空，避免累计旧数据
+        self.cleanable_files = []
+        self.file_types = collections.defaultdict(int)
+        self.top_files = []
+        self.flat_dirs = []
+        self.duplicate_files = collections.defaultdict(list)
+        self.history_data = []
+        self.disk_usage = self._get_disk_usage()
+
+        dir_tree = self._scan_recursive(
+            self.root_path, 0, on_progress=on_progress, stop_event=stop_event
+        )
+
         self._process_duplicates()
+
+        # A：不再二次扫描，只排序/截断
         self._identify_cleanable_files()
+
         self._generate_mock_history()
         return dir_tree
 
-    def _scan_recursive(self, current_path, current_depth):
+    def _emit_progress(self, on_progress):
+        if not on_progress:
+            return
+        try:
+            on_progress({
+                "scanned_files": self.scanned_files_count,
+                "scanned_bytes": self.scanned_bytes,
+                "current_path": self.current_path,
+                "root_path": self.root_path,
+                "started_at": self.scan_started_at,
+            })
+        except Exception:
+            pass
+
+    # -------- Cleanable: 扫描过程中收集（不再二次扫描） --------
+    def _cleanable_level_for_name(self, name: str):
+        patterns = [
+            ('.cache', 4),
+            ('cache', 4),
+            ('tmp', 4),
+            ('temp', 4),
+            ('node_modules', 3),
+            ('__pycache__', 3),
+            ('.log', 2),
+            ('.bak', 2),
+            ('.old', 2),
+            ('.swp', 2),
+        ]
+        low = (name or "").lower()
+        for pat, level in patterns:
+            if pat.startswith('.') and low.endswith(pat):
+                return level
+            if pat in low:
+                return level
+        return None
+
+    def _maybe_add_cleanable(self, path: str, name: str, size: int):
+        level = self._cleanable_level_for_name(name)
+        if level is None:
+            return
+        self.cleanable_files.append({
+            'path': path,
+            'name': name,
+            'size': size,
+            'risk_level': level,
+            'suggestion': self._get_security_suggestion(level)
+        })
+    # ------------------------------------------------------
+
+    def _scan_recursive(self, current_path, current_depth, on_progress=None, stop_event=None):
         dir_stat = {
             'path': current_path,
             'name': os.path.basename(current_path) or current_path,
             'size': 0,
             'children': [],
-            'percentage': 0  # 后续计算
+            'percentage': 0
         }
+
+        self.current_path = current_path
+        self._emit_progress(on_progress)
 
         try:
             with os.scandir(current_path) as it:
                 for entry in it:
+                    if stop_event is not None and getattr(stop_event, "is_set", None) and stop_event.is_set():
+                        return dir_stat
+
                     if entry.is_symlink():
                         continue
 
                     if entry.is_file():
                         try:
-                            size = entry.stat().st_size
+                            st = entry.stat()
+                            size = st.st_size
                             dir_stat['size'] += size
 
-                            # 统计文件类型
+                            # 扫描进度统计
+                            self.scanned_files_count += 1
+                            self.scanned_bytes += size
+                            self.current_path = entry.path
+                            self._emit_progress(on_progress)
+
+                            # 文件类型统计
                             ext = os.path.splitext(entry.name)[1].lower() or "No Ext"
                             self.file_types[ext] += size
 
-                            # 维护 Top-N 大文件
+                            # Top-N
                             self._update_top_files(entry.path, size)
 
-                            # 计算文件哈希用于检测重复
+                            # cleanable：扫描时收集
+                            self._maybe_add_cleanable(entry.path, entry.name, size)
+
+                            # 重复检测（注意：MD5 仍会慢，这是你后续如果还慢再做 B）
                             file_hash = self._get_file_hash(entry.path)
                             if file_hash:
                                 self.duplicate_files[file_hash].append({
                                     'path': entry.path,
                                     'size': size,
-                                    'mtime': entry.stat().st_mtime
+                                    'mtime': st.st_mtime
                                 })
 
                             dir_stat['children'].append({
                                 'path': entry.path,
                                 'name': entry.name,
                                 'size': size,
-                                'children': None  # 用 None 区分文件
+                                'children': None
                             })
                         except (PermissionError, OSError):
                             pass
 
                     elif entry.is_dir():
                         if current_depth < self.max_depth:
-                            # 递归处理子目录
-                            child_stat = self._scan_recursive(entry.path, current_depth + 1)
+                            child_stat = self._scan_recursive(
+                                entry.path, current_depth + 1,
+                                on_progress=on_progress, stop_event=stop_event
+                            )
                             dir_stat['size'] += child_stat['size']
                             dir_stat['children'].append(child_stat)
+
+                            self._maybe_add_cleanable(entry.path, entry.name, child_stat.get('size', 0))
                         else:
-                            # 超过深度的目录，只计算大小不记录子节点
                             size = self._get_deep_size(entry.path)
                             dir_stat['size'] += size
                             dir_stat['children'].append({
@@ -86,21 +181,16 @@ class DiskAnalyzer:
                                 'size': size,
                                 'children': []
                             })
+                            self._maybe_add_cleanable(entry.path, entry.name, size)
 
-            # 按大小对子目录排序
             dir_stat['children'].sort(key=lambda x: x['size'], reverse=True)
-            self.flat_dirs.append({
-                'path': current_path,
-                'size': dir_stat['size'],
-                'percentage': 0  # 后续计算
-            })
+            self.flat_dirs.append({'path': current_path, 'size': dir_stat['size'], 'percentage': 0})
             return dir_stat
 
         except PermissionError:
             return dir_stat
 
     def _get_deep_size(self, path):
-        """快速获取深度目录大小（不记录详细结构）"""
         total = 0
         try:
             for root, _, files in os.walk(path):
@@ -117,16 +207,12 @@ class DiskAnalyzer:
         self.top_files.append((size, path))
         self.top_files.sort(key=lambda x: x[0], reverse=True)
         if len(self.top_files) > self.top_n_limit:
-            self.top_files.pop()  # 移除最小的
+            self.top_files.pop()
 
-    def _get_file_hash(self, path, block_size=65536):
-        """计算文件哈希用于检测重复文件"""
+    def _get_file_hash(self, filepath, block_size=65536):
         try:
-            if os.path.getsize(path) < 1024 * 1024:  # 小于1MB的文件不检测重复
-                return None
-                
             hasher = hashlib.md5()
-            with open(path, 'rb') as f:
+            with open(filepath, 'rb') as f:
                 buf = f.read(block_size)
                 while buf:
                     hasher.update(buf)
@@ -136,109 +222,131 @@ class DiskAnalyzer:
             return None
 
     def _process_duplicates(self):
-        """处理重复文件，只保留有多个实例的组"""
-        # 创建新的defaultdict来存储处理后的结果
-        result = collections.defaultdict(list)
-        for hash_key, files in self.duplicate_files.items():
+        dup = {}
+        for h, files in self.duplicate_files.items():
             if len(files) > 1:
-                # 按修改时间排序
                 files.sort(key=lambda x: x['mtime'], reverse=True)
-                result[hash_key] = files
-        self.duplicate_files = result
+                dup[h] = files
+        self.duplicate_files = dup
 
     def _identify_cleanable_files(self):
-        """识别可清理文件"""
-        cleanable_patterns = {
-            '缓存文件': ['.cache', '/cache/', 'cached'],
-            '日志文件': ['.log', '/logs/'],
-            '临时文件': ['.tmp', '/tmp/', 'temp'],
-            '下载文件': ['/downloads/', '/download/']
-        }
-
-        for size, path in self.top_files:
-            for file_type, patterns in cleanable_patterns.items():
-                if any(pattern in path.lower() for pattern in patterns):
-                    self.cleanable_files.append({
-                        'path': path,
-                        'size': size,
-                        'type': file_type
-                    })
-                    break
-
-    def _get_disk_usage(self):
-        """获取磁盘使用率"""
-        try:
-            stat = os.statvfs(self.root_path)
-            return (1 - stat.f_bavail / stat.f_blocks) * 100
-        except:
-            return 0
+        # A：不再二次扫描，只排序
+        self.cleanable_files.sort(key=lambda x: x.get('size', 0), reverse=True)
+        if len(self.cleanable_files) > 2000:
+            self.cleanable_files = self.cleanable_files[:2000]
 
     def _generate_mock_history(self):
-        """生成模拟的历史数据"""
-        now = datetime.datetime.now() 
+        """生成模拟的历史磁盘使用数据（兼容 reporter.py：date + size + usage）"""
+        self.history_data = []
+        now = datetime.datetime.now()
+
+        used_now = int(self.disk_usage.get("used", 0))
+        total = int(self.disk_usage.get("total", 0))
+
+        # 兜底，避免除零/缺字段
+        if total <= 0:
+            total = max(used_now, 1)
+        if used_now < 0:
+            used_now = 0
+        if used_now > total:
+            used_now = total
+
+        # 生成 30 天：size(bytes) + usage(百分比)
+        swing = max(1, int(total * 0.005))  # 总量的 0.5% 波动
         for i in range(30):
-            date = now - datetime.timedelta(days=29 - i)
+            day = now - datetime.timedelta(days=29 - i)
+
+            # 做一点平滑趋势：前半段略低，后半段略高
+            drift = int((i - 15) * (swing / 15))  # 约 [-swing, +swing]
+            size = used_now + drift
+            if size < 0:
+                size = 0
+            if size > total:
+                size = total
+
+            usage = (size / total) * 100.0 if total > 0 else 0.0
+
             self.history_data.append({
-                'date': date.strftime('%Y-%m-%d'),
-                'usage': min(90, 40 + (i % 10) * 3 + (i // 10) * 2),
-                'size': (200 + i * 2.5) * 1024 * 1024 * 1024  # 转换为字节
-            })
+                "date": day.strftime("%Y-%m-%d"),
+                "size": int(size),            # bytes
+                "usage": round(usage, 2),     # 百分比（reporter.py 需要）
+        })
 
-    def get_enhanced_summary(self, total_size):
-        """生成增强版摘要数据"""
-        # 计算百分比
-        for dir_info in self.flat_dirs:
-            dir_info['percentage'] = (dir_info['size'] / total_size) * 100 if total_size > 0 else 0
-        
-        # 排序扁平目录
-        self.flat_dirs.sort(key=lambda x: x['size'], reverse=True)
-        
-        # 生成安全建议
-        security_suggestions = []
-        for file in self.cleanable_files[:10]:
-            if 'cache' in file['type'].lower() or 'temp' in file['type'].lower():
-                level = 3  # 低风险
-            elif 'log' in file['type'].lower():
-                level = 2  # 中风险
-            elif 'system' in file['path'].lower():
-                level = 1  # 高风险
-            else:
-                level = 4  # 安全
-            
-            security_suggestions.append({
-                'path': file['path'],
-                'size': file['size'],
-                'security_level': level,
-                'whitelist': False,
-                'suggestion': self._get_security_suggestion(level)
-            })
 
-        return {
-            'path': self.root_path,
-            'total_size': total_size,
-            'dir_tree': self._add_percentages(self.scan()),
-            'flat_dirs': self.flat_dirs,
-            'file_types': dict(self.file_types),
-            'duplicate_files': self.duplicate_files,
-            'cleanable_files': self.cleanable_files,
-            'security_suggestions': security_suggestions,
-            'history_data': self.history_data,
-            'disk_usage': self.disk_usage
+    def _get_disk_usage(self):
+        try:
+            st = os.statvfs(self.root_path)
+            total = st.f_frsize * st.f_blocks
+            free = st.f_frsize * st.f_bfree
+            used = total - free
+            used_percent = (used / total) * 100 if total > 0 else 0
+            return {"total": total, "used": used, "free": free, "used_percent": round(used_percent, 2)}
+        except:
+            return {"total": 0, "used": 0, "free": 0, "used_percent": 0}
+
+    def get_enhanced_summary(self, dir_tree):
+        total_size = (dir_tree or {}).get('size', 0)
+
+        # reporter.py 需要 duplicate_files 是 “list of groups(list)”
+        # 同时我们按“浪费空间”排序（除去最新那个，其余算浪费）
+        dup_groups = []
+        for _h, files in self.duplicate_files.items():
+            if not files or len(files) < 2:
+                continue
+            # files 已在 _process_duplicates 里按 mtime desc 排过序（最新在前）
+            wasted = sum(f.get("size", 0) for f in files[1:])
+            dup_groups.append((wasted, files))
+
+        dup_groups.sort(key=lambda x: x[0], reverse=True)
+        duplicate_files_for_reporter = [files for wasted, files in dup_groups]
+
+        enhanced_summary = {
+            "root_path": self.root_path,
+            "total_size": total_size,
+            "disk_usage": self.disk_usage,
+
+            # reporter.py 的 pie 用 dict.values()
+            "file_types": dict(self.file_types),
+
+            "top_files": [
+                {"path": p, "size": s, "percentage": (s / total_size) * 100 if total_size > 0 else 0}
+                for s, p in self.top_files
+            ],
+
+            "flat_dirs": [],
+            # ✅ 关键：这里改成 reporter 期望的结构
+            "duplicate_files": duplicate_files_for_reporter,
+
+            "cleanable_files": self.cleanable_files[:50],
+            "history_data": self.history_data,
+
+            # reporter.py 需要 dir_tree
+            "dir_tree": self._add_percentages(dir_tree, total_size) if dir_tree else {},
         }
 
-    def _add_percentages(self, dir_tree, total_size=None):
-        """为目录树添加百分比"""
-        if total_size is None:
-            total_size = dir_tree['size']
-            
+        for d in self.flat_dirs:
+            d["percentage"] = (d["size"] / total_size) * 100 if total_size > 0 else 0
+            enhanced_summary["flat_dirs"].append(d)
+        enhanced_summary["flat_dirs"].sort(key=lambda x: x["size"], reverse=True)
+
+        return enhanced_summary
+
+    def _add_percentages(self, dir_tree, total_size):
+        if not dir_tree:
+            return dir_tree
+        if dir_tree.get('children') is None:
+            return dir_tree
+
+        # 根节点 percentage 也补上
+        dir_tree['percentage'] = (dir_tree.get('size', 0) / total_size) * 100 if total_size > 0 else 0
+
         for child in dir_tree.get('children', []):
-            if child['children'] is not None:  # 是目录
-                child['percentage'] = (child['size'] / total_size) * 100 if total_size > 0 else 0
+            if child.get('children') is not None:
+                child['percentage'] = (child.get('size', 0) / total_size) * 100 if total_size > 0 else 0
                 self._add_percentages(child, total_size)
         return dir_tree
 
     def _get_security_suggestion(self, level):
-        """获取安全删除建议"""
         suggestions = {
             1: '高风险文件，禁止删除！可能导致系统/程序异常',
             2: '中风险文件，建议备份后再删除，删除前确认不再需要',
