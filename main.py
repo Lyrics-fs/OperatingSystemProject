@@ -41,22 +41,33 @@ def _read_key_nonblocking():
     return None
 
 
+def _terminal_width(default=120):
+    try:
+        return os.get_terminal_size().columns
+    except OSError:
+        return default
+
+
 def _print_scan_progress_line(stats, stopped=False):
     cur = stats.get("current_path") or ""
-    term_width = 120
-    try:
-        term_width = os.get_terminal_size().columns
-    except OSError:
-        pass
+    term_width = _terminal_width()
 
     left = f"Scanning...  files={stats.get('scanned_files', 0)}  size={format_size(stats.get('scanned_bytes', 0))}"
     hint = "  [q] stop" if not stopped else "  stopping..."
-    max_cur = max(10, term_width - len(left) - len(hint) - 5)
+
+    # 预留：至少要能显示 current=
+    max_cur = max(10, term_width - len(left) - len("  current=") - len(hint) - 1)
     if len(cur) > max_cur:
         cur = "…" + cur[-(max_cur - 1):]
+
     line = f"{left}  current={cur}{hint}"
-    pad = " " * max(0, term_width - len(line))
-    sys.stdout.write("\r" + line + pad)
+
+    # ✅ 防止换行导致“输出粘连”：强制截断
+    if len(line) >= term_width:
+        line = line[: max(0, term_width - 1)]
+
+    # ✅ ANSI 清行 + 回到行首
+    sys.stdout.write("\r\033[2K" + line)
     sys.stdout.flush()
 
 
@@ -90,7 +101,7 @@ def run_scan_with_live_progress(path, depth):
         last_draw = 0.0
         while t.is_alive():
             now = time.time()
-            if now - last_draw >= 0.05:
+            if now - last_draw >= 0.15:  # ✅ 降低刷新频率，减少刷屏
                 with lock:
                     stats = dict(latest_stats)
                 _print_scan_progress_line(stats, stopped=stop_event.is_set())
@@ -100,7 +111,7 @@ def run_scan_with_live_progress(path, depth):
             if k in ("q", "Q"):
                 stop_event.set()
 
-            time.sleep(0.01)
+            time.sleep(0.03)
 
     with lock:
         stats = dict(latest_stats)
@@ -143,15 +154,11 @@ def monitor_disk(path, interval_sec=2.0):
                 f"used={format_size(used)}/{format_size(total)} ({used_pct:.1f}%)  "
                 f"avail={format_size(avail)}{delta}  [q] quit"
             )
-            term_width = 120
-            try:
-                term_width = os.get_terminal_size().columns
-            except OSError:
-                pass
-            if len(line) > term_width:
-                line = line[: max(0, term_width - 1)] + "…"
-            pad = " " * max(0, term_width - len(line))
-            sys.stdout.write("\r" + line + pad)
+            term_width = _terminal_width()
+            if len(line) >= term_width:
+                line = line[: max(0, term_width - 1)]
+
+            sys.stdout.write("\r\033[2K" + line)
             sys.stdout.flush()
 
             end = time.time() + interval_sec
@@ -168,17 +175,14 @@ def main():
     parser = argparse.ArgumentParser(description="Linux 磁盘使用分析与管理工具")
     parser.add_argument("path", nargs="?", default=".", help="要扫描的目录路径 (默认: 当前目录)")
     parser.add_argument("--depth", type=int, default=2, help="目录扫描深度 (默认: 2)")
-
     parser.add_argument("--report", action="store_true", help="生成 HTML 报告而不启动 UI")
     parser.add_argument("--enhanced", action="store_true", help="生成增强版 HTML 报告")
-
     parser.add_argument("--tui", action="store_true", help="扫描完成后进入 TUI（目录树浏览）")
     parser.add_argument("--monitor", action="store_true", help="扫描完成后进入实时监测（默认行为）")
     parser.add_argument("--interval", type=float, default=2.0, help="监控刷新间隔秒数 (默认: 2.0)")
-
     args = parser.parse_args()
-    scan_path = args.path
 
+    scan_path = args.path
     if not os.path.exists(scan_path):
         print(f"路径不存在: {scan_path}")
         sys.exit(1)
@@ -189,7 +193,6 @@ def main():
         print("扫描已停止（按 q）。结果可能不完整。")
 
     if args.report or args.enhanced:
-        # ✅ 修复：summary 的结构要与 reporter.py 匹配
         summary_data = analyzer.get_enhanced_summary(tree_data)
         reporter = EnhancedHTMLReporter(summary_data)
         out = "enhanced_disk_report.html" if args.enhanced else "disk_report.html"
